@@ -425,6 +425,53 @@ class PagedOverdueInvoices(BaseModel):
     as_of: str
 
 
+# ---- 应收账龄汇总 ----
+
+
+class AgingBucket(BaseModel):
+    """单个账龄桶：落入该桶的发票数与其未收额合计。"""
+
+    model_config = ConfigDict(extra="allow")
+    invoice_count: int
+    outstanding: str
+
+
+class NoDueDateBucket(BaseModel):
+    """无到期日发票单列的账龄桶（不参与未到期/逾期分桶）。"""
+
+    model_config = ConfigDict(extra="allow")
+    invoice_count: int
+    outstanding: str
+
+
+class CurrencyAging(BaseModel):
+    """单个币种的应收账龄汇总：不跨币种相加，金额为该币种精度的十进制字符串。"""
+
+    model_config = ConfigDict(extra="allow")
+    currency: str
+    currency_digits: int
+    total_invoice_count: int
+    total_outstanding: str
+    no_due_date: NoDueDateBucket
+    aging: list[AgingBucket]
+
+
+class ReceivablesAging(BaseModel):
+    """截至查询日 UTC 结束（同秒闭区间）的应收账龄汇总。
+
+    只统计查询日结束前已创建、含税总额为正且仍有未收额（收款 − 冲销，
+    截止秒闭区间）的发票；每张发票的全部未收额只进入一个账龄桶：
+    ``no_due_date`` 单列无到期日发票，``aging`` 固定按
+    ``not_due`` / ``overdue_1_30`` / ``overdue_31_60`` /
+    ``overdue_61_90`` / ``overdue_91_plus`` 顺序给出（到期当日计入
+    ``not_due``）。按发票币种分别汇总、不跨币种相加；无符合条件发票的
+    币种不出现，``currencies`` 按币种代码升序。
+    """
+
+    as_of: str
+    currencies: list[CurrencyAging]
+
+
 # ---- 分期回款计划 ----
 
 

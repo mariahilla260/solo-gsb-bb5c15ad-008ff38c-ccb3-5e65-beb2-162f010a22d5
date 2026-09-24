@@ -365,6 +365,150 @@ def list_overdue_invoices(
     return overdue[offset : offset + page_size], total
 
 
+# ---- 应收账龄汇总 ----
+
+
+# 账龄桶的固定顺序（无到期日单列；其余按查询日与到期日之差升序）
+AGING_BUCKETS: tuple[str, ...] = (
+    "not_due",
+    "overdue_1_30",
+    "overdue_31_60",
+    "overdue_61_90",
+    "overdue_91_plus",
+)
+
+
+def _aging_bucket(due_date_text: str | None, as_of: date) -> str:
+    """发票的全部未收额进入的唯一年龄桶。
+
+    无到期日 -> ``no_due_date``；有到期日时按查询日与到期日之差
+    （``as_of - due_date``，单位天）：
+
+    * ``<= 0``（含到期当日与尚未到期）-> ``not_due``；
+    * 1~30 -> ``overdue_1_30``；31~60 -> ``overdue_31_60``；
+    * 61~90 -> ``overdue_61_90``；``>= 91`` -> ``overdue_91_plus``。
+    """
+
+    if due_date_text is None:
+        return "no_due_date"
+    days = (as_of - date.fromisoformat(due_date_text)).days
+    if days <= 0:
+        return "not_due"
+    if days <= 30:
+        return "overdue_1_30"
+    if days <= 60:
+        return "overdue_31_60"
+    if days <= 90:
+        return "overdue_61_90"
+    return "overdue_91_plus"
+
+
+def receivables_aging(conn: sqlite3.Connection, as_of: date) -> dict[str, Any]:
+    """按发票币种汇总截至查询日 UTC 结束时的应收账龄（纯读，Decimal 计算）。
+
+    纳入统计的发票须**同时**满足：
+
+    1. 查询日 UTC 结束（``as_of`` 23:59:59，闭区间、同秒计入）前已创建，
+       即 ``invoices.created_at <= as_ofT23:59:59Z``；
+    2. 含税总额 ``total_gross`` 为**正**（0 或负数发票不参与）；
+    3. 截至同一秒仍有未收额：``total_gross − 净入账 > 0``，净入账 =
+       ``created_at <= 截止秒`` 的收款 − 关联冲销（与历史收款快照同一口径），
+       截止后写入的任何流水都不参与。
+
+    满足条件的每张发票，其**全部未收额只进入一个桶**：无到期日进
+    ``no_due_date``；有到期日按查询日与到期日之差（天）分入 ``not_due``
+    （到期日当天及之前即逾期天数 ``<= 0`` 计入，含到期当日）、
+    ``overdue_1_30`` / ``overdue_31_60`` / ``overdue_61_90`` /
+    ``overdue_91_plus``。
+
+    按**发票币种分别汇总，绝不跨币种相加**：每个币种返回各桶的发票数与未收
+    合计、无到期日桶，以及该币种的总未收额与发票总数；金额格式化为符合币种
+    精度的十进制字符串（USD 两位、JPY 不带小数、KWD 三位）。无任何符合条件
+    发票的币种不出现在结果中；币种按代码升序，各桶始终按固定顺序给出（空桶
+    为 ``0`` 张、金额 ``"0.00"`` 等）。
+    """
+
+    # 查询日 UTC 结束的最后一秒（闭区间：同秒创建的发票/流水全部计入）
+    cutoff_text = f"{as_of.isoformat()}T23:59:59Z"
+
+    rows = list(
+        conn.execute(
+            """
+            SELECT id, currency, currency_digits, due_date, total_gross, created_at
+            FROM invoices
+            WHERE created_at <= ?
+            ORDER BY currency, id
+            """,
+            (cutoff_text,),
+        ).fetchall()
+    )
+
+    paid_map = _paid_totals(
+        conn, [int(r["id"]) for r in rows], at_text=cutoff_text
+    )
+
+    # currency -> bucket key -> [count, Decimal amount]
+    buckets: dict[str, dict[str, list[Any]]] = {}
+    digits_by_currency: dict[str, int] = {}
+    for r in rows:
+        gross = Decimal(r["total_gross"])
+        if gross <= 0:
+            # 含税总额为正才统计（0 / 负数发票排除）
+            continue
+        currency = r["currency"]
+        unit = _minor_unit(int(r["currency_digits"]))
+        paid = paid_map.get(int(r["id"]), Decimal("0")).quantize(unit)
+        outstanding = gross - paid
+        if outstanding <= 0:
+            # 已收满（或历史流水超收的防御情形）不进入账龄
+            continue
+
+        digits_by_currency[currency] = int(r["currency_digits"])
+        currency_buckets = buckets.setdefault(
+            currency,
+            {
+                key: [0, Decimal("0")]
+                for key in ("no_due_date", *AGING_BUCKETS)
+            },
+        )
+        key = _aging_bucket(r["due_date"], as_of)
+        currency_buckets[key][0] += 1
+        currency_buckets[key][1] += outstanding
+
+    currencies_out: list[dict[str, Any]] = []
+    for currency in sorted(buckets):
+        unit = _minor_unit(digits_by_currency[currency])
+
+        def bucket_entry(key: str) -> dict[str, Any]:
+            count, amount = buckets[currency][key]
+            return {
+                "invoice_count": count,
+                "outstanding": format(amount.quantize(unit), "f"),
+            }
+
+        no_due_count, no_due_amount = buckets[currency]["no_due_date"]
+        aging = [bucket_entry(key) for key in AGING_BUCKETS]
+        total_count = no_due_count + sum(entry["invoice_count"] for entry in aging)
+        total_amount = no_due_amount + sum(
+            (buckets[currency][key][1] for key in AGING_BUCKETS), Decimal("0")
+        )
+        currencies_out.append(
+            {
+                "currency": currency,
+                "currency_digits": digits_by_currency[currency],
+                "total_invoice_count": total_count,
+                "total_outstanding": format(total_amount.quantize(unit), "f"),
+                "no_due_date": {
+                    "invoice_count": no_due_count,
+                    "outstanding": format(no_due_amount.quantize(unit), "f"),
+                },
+                "aging": aging,
+            }
+        )
+
+    return {"as_of": as_of.isoformat(), "currencies": currencies_out}
+
+
 # ---- 收款登记 ----
 
 
@@ -570,17 +714,36 @@ def reverse_payment(
     }
 
 
-def _paid_totals(conn: sqlite3.Connection, invoice_ids: list[int]) -> dict[int, Decimal]:
-    """一批发票的净入账合计（收款 − 冲销）。用 Decimal 逐笔求和，不走浮点 SUM 聚合。"""
+def _paid_totals(
+    conn: sqlite3.Connection,
+    invoice_ids: list[int],
+    at_text: str | None = None,
+) -> dict[int, Decimal]:
+    """一批发票的净入账合计（收款 − 冲销）。用 Decimal 逐笔求和，不走浮点 SUM 聚合。
+
+    ``at_text`` 给出 UTC 秒精度截止时点（``YYYY-MM-DDTHH:MM:SSZ``）时，只合计
+    ``created_at <= at_text`` 的收款（截止秒为闭区间，同秒计入），冲销同样只取
+    关联上述收款且 ``created_at <= at_text`` 的部分（与历史快照、账龄汇总口径一致）；
+    缺省则合计全部收款与冲销。
+    """
 
     if not invoice_ids:
         return {}
     placeholders = ",".join("?" for _ in invoice_ids)
-    rows = conn.execute(
-        f"SELECT id, invoice_id, amount FROM payments WHERE invoice_id IN ({placeholders})",
-        invoice_ids,
-    ).fetchall()
-    reversed_map = _reversed_totals(conn, [int(r["id"]) for r in rows])
+    if at_text is None:
+        rows = conn.execute(
+            f"SELECT id, invoice_id, amount FROM payments WHERE invoice_id IN ({placeholders})",
+            invoice_ids,
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            f"SELECT id, invoice_id, amount FROM payments"
+            f" WHERE invoice_id IN ({placeholders}) AND created_at <= ?",
+            (*invoice_ids, at_text),
+        ).fetchall()
+    reversed_map = _reversed_totals(
+        conn, [int(r["id"]) for r in rows], at_text=at_text
+    )
     paid: dict[int, Decimal] = {}
     for r in rows:
         iid = int(r["invoice_id"])

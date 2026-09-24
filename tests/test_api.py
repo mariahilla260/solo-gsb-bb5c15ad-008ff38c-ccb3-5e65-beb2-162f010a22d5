@@ -2041,6 +2041,199 @@ class ApiTests(unittest.TestCase):
         # 逐次税额之和恰好抵完原行已确认税额
         self.assertEqual(sum(Decimal(t) for t in taxes), Decimal("1.30"))
 
+    def test_36_receivables_aging(self) -> None:
+        import sqlite3
+
+        db_file = os.environ["DB_PATH"]
+        fixed_created = "2026-09-24T00:00:00Z"
+
+        def sql_set(table: str, row_id: int, ts: str, id_col: str = "id") -> None:
+            c = sqlite3.connect(db_file, timeout=30)
+            try:
+                c.execute(
+                    f"UPDATE {table} SET created_at = ? WHERE {id_col} = ?",
+                    (ts, row_id),
+                )
+                c.commit()
+            finally:
+                c.close()
+
+        def make_invoice(currency: str, gross: str, due_date: str | None,
+                         created_at: str = fixed_created) -> int:
+            payload = {
+                "currency": currency,
+                "lines": [{"net": gross, "tax_rate": "0"}],
+            }
+            if due_date is not None:
+                payload["due_date"] = due_date
+            status, inv = self._request("POST", "/api/v1/invoices", payload)
+            self.assertEqual(status, 201, inv)
+            invoice_id = inv["id"]
+            sql_set("invoices", invoice_id, created_at)
+            return invoice_id
+
+        def pay(invoice_id: int, amount: str, ts: str) -> int:
+            status, resp = self._request(
+                "POST", f"/api/v1/invoices/{invoice_id}/payments", {"amount": amount}
+            )
+            self.assertEqual(status, 201, resp)
+            pid = resp["id"]
+            sql_set("payments", pid, ts)
+            return pid
+
+        def reverse(payment_id: int, amount: str, ts: str) -> None:
+            status, resp = self._request(
+                "POST", f"/api/v1/payments/{payment_id}/reversals",
+                {"amount": amount},
+            )
+            self.assertEqual(status, 201, resp)
+            sql_set("payment_reversals", resp["id"], ts)
+
+        # ---- EUR 发票集（as_of=2026-10-15，差额天数 = as_of - due_date）----
+        id_a = make_invoice("EUR", "100.00", "2026-10-15")          # A 到期当日 -> not_due
+        id_b = make_invoice("EUR", "100.00", "2026-10-14")          # B 逾期 1 天
+        id_c = make_invoice("EUR", "100.00", "2026-09-15")          # C 逾期 30 天（边界）
+        id_d = make_invoice("EUR", "100.00", "2026-09-14")          # D 逾期 31 天（边界）
+        id_e = make_invoice("EUR", "100.00", "2026-08-16")          # E 逾期 60 天（边界）
+        id_f = make_invoice("EUR", "100.00", "2026-08-15")          # F 逾期 61 天（边界）
+        id_g = make_invoice("EUR", "100.00", "2026-07-17")          # G 逾期 90 天（边界）
+        id_h = make_invoice("EUR", "100.00", "2026-07-16")          # H 逾期 91 天（边界）
+        id_i = make_invoice("EUR", "100.00", "2026-01-01")          # I 远期逾期
+        id_j = make_invoice("EUR", "100.00", None)                  # J 无到期日
+        id_k = make_invoice("EUR", "100.00", None)                  # K 无到期日
+        make_invoice("EUR", "100.00", "2026-10-01",
+                     created_at="2026-10-20T00:00:00Z")              # L 查询日后才创建
+        make_invoice("EUR", "-50.00", "2026-09-01")                 # M 含税总额为负
+        id_n = make_invoice("EUR", "100.00", "2026-09-01")          # N 逾期 44 天
+        id_o = make_invoice("EUR", "200.00", None)                  # O 无到期日 + 贷项凭证
+        id_p = make_invoice("EUR", "100.00", "2026-09-20")          # P 逾期 25 天
+        id_q = make_invoice("EUR", "50.00", "2026-10-15",
+                     created_at="2026-10-15T23:59:59Z")              # Q 截止秒当秒创建
+        id_r = make_invoice("EUR", "100.00", "2026-09-10")          # R 逾期 35 天
+
+        # C：截止前部分收款 40 -> 未收 60
+        pay(id_c, "40.00", "2026-09-20T08:00:00Z")
+        # I：截止前已收满 -> 排除
+        pay(id_i, "100.00", "2026-09-20T08:00:00Z")
+        # K：截止前收满；冲销发生在截止秒之后 -> 截止时仍收满，排除
+        pid_k = pay(id_k, "100.00", "2026-09-20T08:00:00Z")
+        reverse(pid_k, "50.00", "2026-10-20T00:00:00Z")
+        # N：截止前收款 20、冲销 5 -> 净入账 15，未收 85
+        pid_n = pay(id_n, "20.00", "2026-09-20T08:00:00Z")
+        reverse(pid_n, "5.00", "2026-09-21T08:00:00Z")
+        # O：贷项凭证不改写收款流水，未收仍为含税总额 200
+        status, memo = self._request(
+            "POST", f"/api/v1/invoices/{id_o}/credit-memos",
+            {"lines": [{"line_no": 1, "net": "50.00"}]},
+        )
+        self.assertEqual(status, 201, memo)
+        # P：收款在截止日 10:00（计入 25），冲销在截止秒之后（不计）-> 未收 75
+        pid_p = pay(id_p, "25.00", "2026-10-15T10:00:00Z")
+        reverse(pid_p, "10.00", "2026-10-16T00:00:00Z")
+        # Q：发票与收款都在截止秒当秒（闭区间）-> 未收 40
+        pay(id_q, "10.00", "2026-10-15T23:59:59Z")
+        # R：收款发生在截止秒之后 -> 截止时未收仍为 100
+        pay(id_r, "100.00", "2026-10-20T00:00:00Z")
+
+        # ---- KRW（0 位小数）/ KWD（3 位小数）----
+        make_invoice("KRW", "1000", "2026-09-14")           # 逾期 31 天
+        make_invoice("KWD", "10.000", None)                 # 无到期日
+        make_invoice("KWD", "5.000", "2026-10-15")          # 到期当日
+
+        status, body = self._request(
+            "GET", "/api/v1/receivables/aging?as_of=2026-10-15"
+        )
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["as_of"], "2026-10-15")
+
+        by_ccy = {c["currency"]: c for c in body["currencies"]}
+        # 币种按代码升序；只断言本测试使用的三个币种（其他测试遗留的
+        # USD/JPY/CNY 发票也会出现，账龄本来就按全库统计）
+        all_codes = [c["currency"] for c in body["currencies"]]
+        self.assertEqual(all_codes, sorted(all_codes))
+        self.assertEqual(
+            [code for code in all_codes if code in ("EUR", "KRW", "KWD")],
+            ["EUR", "KRW", "KWD"],
+        )
+
+        eur = by_ccy["EUR"]
+        self.assertEqual(eur["currency_digits"], 2)
+        self.assertEqual(eur["total_invoice_count"], 14)
+        self.assertEqual(eur["total_outstanding"], "1360.00")
+        self.assertEqual(eur["no_due_date"],
+                         {"invoice_count": 2, "outstanding": "300.00"})
+        # 六个桶固定顺序：not_due / 1-30 / 31-60 / 61-90 / 91+
+        self.assertEqual(
+            [(b["invoice_count"], b["outstanding"]) for b in eur["aging"]],
+            [
+                (2, "140.00"),    # A 100 + Q 40（到期当日 + 同秒收款）
+                (3, "235.00"),    # B 100 + C 60 + P 75
+                (4, "385.00"),    # D 100 + E 100 + N 85 + R 100
+                (2, "200.00"),    # F + G
+                (1, "100.00"),    # H
+            ],
+        )
+
+        # KRW：0 位精度，空桶金额为 "0"
+        krw = by_ccy["KRW"]
+        self.assertEqual(krw["currency_digits"], 0)
+        self.assertEqual(krw["total_invoice_count"], 1)
+        self.assertEqual(krw["total_outstanding"], "1000")
+        self.assertEqual(krw["no_due_date"],
+                         {"invoice_count": 0, "outstanding": "0"})
+        self.assertEqual(
+            [(b["invoice_count"], b["outstanding"]) for b in krw["aging"]],
+            [(0, "0"), (0, "0"), (1, "1000"), (0, "0"), (0, "0")],
+        )
+
+        # KWD：3 位精度
+        kwd = by_ccy["KWD"]
+        self.assertEqual(kwd["currency_digits"], 3)
+        self.assertEqual(kwd["total_invoice_count"], 2)
+        self.assertEqual(kwd["total_outstanding"], "15.000")
+        self.assertEqual(kwd["no_due_date"],
+                         {"invoice_count": 1, "outstanding": "10.000"})
+        self.assertEqual(
+            [(b["invoice_count"], b["outstanding"]) for b in kwd["aging"]],
+            [(1, "5.000"), (0, "0.000"), (0, "0.000"),
+             (0, "0.000"), (0, "0.000")],
+        )
+
+        # 各币种桶发票数之和等于总发票数；金额之和等于总未收额
+        from decimal import Decimal
+        for c in body["currencies"]:
+            bucket_counts = c["no_due_date"]["invoice_count"] + sum(
+                b["invoice_count"] for b in c["aging"]
+            )
+            bucket_amount = (
+                Decimal(c["no_due_date"]["outstanding"])
+                + sum((Decimal(b["outstanding"]) for b in c["aging"]), Decimal("0"))
+            )
+            self.assertEqual(bucket_counts, c["total_invoice_count"])
+            self.assertEqual(format(bucket_amount, "f"), c["total_outstanding"])
+
+        # 远古查询日：所有发票都尚未创建 -> 空币种列表
+        status, early = self._request(
+            "GET", "/api/v1/receivables/aging?as_of=2000-01-01"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(early["as_of"], "2000-01-01")
+        self.assertEqual(early["currencies"], [])
+
+    def test_37_receivables_aging_validation(self) -> None:
+        # 缺少必填 as_of -> 422
+        status, body = self._request("GET", "/api/v1/receivables/aging")
+        self.assertEqual(status, 422)
+
+        # 非法日期一律 422：格式不符 / 不存在的日期 / 带时间成分
+        for bad in ("2026-10", "2026-10-15T00:00:00Z", "2026/10/15",
+                    "2026-13-01", "2026-02-30", "not-a-date"):
+            status, resp = self._request(
+                "GET", f"/api/v1/receivables/aging?as_of={bad}"
+            )
+            self.assertEqual(status, 422, bad)
+            self.assertIn("detail", resp)
+
 
 if __name__ == "__main__":
     unittest.main()
