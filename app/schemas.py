@@ -425,6 +425,42 @@ class PagedOverdueInvoices(BaseModel):
     as_of: str
 
 
+# ---- 应收账龄汇总 ----
+
+
+class AgingBucketOut(BaseModel):
+    """单个账龄桶：发票数与未收合计（金额为发票币种十进制字符串）。"""
+
+    model_config = ConfigDict(extra="allow")
+    bucket: str
+    invoice_count: int
+    outstanding: str
+
+
+class AgingCurrencyOut(BaseModel):
+    """单个币种的账龄汇总：各桶发票数/未收合计与该币种总未收额，不跨币种相加。"""
+
+    model_config = ConfigDict(extra="allow")
+    currency: str
+    currency_digits: int
+    invoice_count: int
+    total_outstanding: str
+    buckets: list[AgingBucketOut]
+
+
+class ReceivablesAgingSummary(BaseModel):
+    """按查询日 UTC 结束时点（含当秒）的应收账龄汇总，按发票币种分别成列。
+
+    只统计查询日 23:59:59Z 前已创建、含税总额为正且仍有未收额的发票；每张
+    发票的全部未收额只进入一个账龄桶（无到期日单列；未到期含到期当日；
+    逾期 1~30 / 31~60 / 61~90 / 91 天及以上）。
+    """
+
+    as_of: str
+    cutoff_at: str
+    currencies: list[AgingCurrencyOut]
+
+
 # ---- 分期回款计划 ----
 
 

@@ -38,6 +38,7 @@ from .schemas import (
     PaymentOverview,
     PaymentResult,
     PaymentSnapshot,
+    ReceivablesAgingSummary,
     ReversalCreate,
     ReversalResult,
     parse_iso_date,
@@ -55,7 +56,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(
     title="发票税额计算 API",
-    version="1.8.0",
+    version="1.9.0",
     description=(
         "基于 Decimal 的发票税额计算服务：按币种最小单位舍入、"
         "最大余数法分配残差、可复算，支持跨币种换算、收款登记与未收余额查询、"
@@ -67,6 +68,7 @@ app = FastAPI(
         "对已保存发票正净额行的原发票贷项凭证（多行部分抵扣、按累计净额比例摊算税额、"
         "完全抵扣恰好抵完原行税额、不改写原发票与收款流水）、"
         "供应商发票号码批次查重（NFKC 规范化后同供应商内判重）、"
+        "应收账龄汇总（查询日 UTC 结束时点、按币种分桶、不跨币种相加）、"
         "SQLite 持久化。"
     ),
     lifespan=lifespan,
@@ -256,6 +258,40 @@ def list_overdue_invoices(
         "pages": pages,
         "as_of": cutoff.isoformat(),
     }
+
+
+@app.get(
+    "/api/v1/receivables/aging",
+    response_model=ReceivablesAgingSummary,
+    tags=["receivables"],
+)
+def receivables_aging(
+    as_of: str | None = Query(
+        None,
+        description="查询日期 ISO 8601（YYYY-MM-DD）；缺省取 UTC 当前日期。"
+        "统计该日 UTC 结束时（23:59:59Z，含当秒）已创建、含税总额为正"
+        "且仍有未收额的发票，未收额按截至该秒的收款 − 冲销计算",
+    ),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> dict[str, Any]:
+    """应收账龄汇总（按发票币种分别汇总，不跨币种相加）。
+
+    只统计查询日 UTC 结束时点（``as_ofT23:59:59Z``，截止秒闭区间、同秒流水
+    全部计入）**已创建**、**含税总额为正**且**仍有未收额**的发票；未收额 =
+    含税总额 − 截至该秒的净入账合计（收款 − 冲销）。每张发票的全部未收额
+    **只进入一个账龄桶**：无到期日单列 ``no_due_date``；有到期日按查询日与
+    到期日之差分入未到期（``current``，**含到期当日**）、逾期 1~30、31~60、
+    61~90、91 天及以上。各桶返回发票数与未收合计，每个币种返回总未收额；
+    金额为按币种精度取整的十进制字符串，币种按代码升序排列。非法日期返回 422。
+    """
+
+    if as_of is None:
+        cutoff = datetime.now(timezone.utc).date()
+    else:
+        # 非法日期走全局 ValueError -> 422 处理器
+        cutoff = parse_iso_date(as_of, "as_of")
+
+    return database.receivables_aging_summary(conn, cutoff)
 
 
 @app.get(

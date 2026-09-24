@@ -2041,6 +2041,248 @@ class ApiTests(unittest.TestCase):
         # 逐次税额之和恰好抵完原行已确认税额
         self.assertEqual(sum(Decimal(t) for t in taxes), Decimal("1.30"))
 
+    def test_36_receivables_aging_buckets(self) -> None:
+        # 用与历史用例隔离的币种（EUR 2 位、KRW 0 位），全部时间戳回拨到 2029，
+        # 使 as_of=2030-01-15 的结果完全确定、不受真实当前时间影响
+        import sqlite3
+        from decimal import Decimal
+
+        db_file = os.environ["DB_PATH"]
+
+        def set_time(table: str, row_id: int, ts: str) -> None:
+            c = sqlite3.connect(db_file, timeout=30)
+            try:
+                c.execute(
+                    f"UPDATE {table} SET created_at = ? WHERE id = ?", (ts, row_id)
+                )
+                c.commit()
+            finally:
+                c.close()
+
+        def eur_invoice(due: str | None, net: str = "100.00") -> int:
+            status, body = self._request(
+                "POST",
+                "/api/v1/invoices",
+                {"currency": "EUR", "due_date": due,
+                 "lines": [{"net": net, "tax_rate": "0"}]},
+            )
+            self.assertEqual(status, 201, body)
+            iid = body["id"]
+            # 0% 税率：含税总额 == 净额
+            self.assertEqual(body["totals"]["total_gross"], net)
+            set_time("invoices", iid, "2029-09-01T00:00:00Z")
+            return iid
+
+        # as_of = 2030-01-15：逐桶边界（差 0/1/30/31/60/61/90/91/106 天）
+        i_current = eur_invoice("2030-01-15")   # 到期当日 -> current
+        i_d1 = eur_invoice("2030-01-14")        # 逾期 1 天（部分收款 40 -> 未收 60）
+        i_d30 = eur_invoice("2029-12-16")       # 逾期 30 天
+        i_d31 = eur_invoice("2029-12-15")       # 逾期 31 天
+        i_d60 = eur_invoice("2029-11-16")       # 逾期 60 天
+        i_d61 = eur_invoice("2029-11-15")       # 逾期 61 天
+        i_d90 = eur_invoice("2029-10-17")       # 逾期 90 天
+        i_d91 = eur_invoice("2029-10-16")       # 逾期 91 天
+        i_d106 = eur_invoice("2029-10-01")      # 逾期 106 天
+        i_nodue = eur_invoice(None)             # 无到期日单列
+        i_paid = eur_invoice("2030-01-10")      # 已收满 -> 排除
+        i_neg = eur_invoice("2030-01-10", "-10.00")  # 含税总额为负 -> 排除
+        i_future = eur_invoice("2030-01-10")    # 查询日结束后才创建 -> 排除
+        set_time("invoices", i_future, "2030-01-16T00:00:00Z")
+
+        # 逾期 1 天的发票部分收款 40（截止时点之前）-> 未收 60
+        status, pay = self._request(
+            "POST", f"/api/v1/invoices/{i_d1}/payments", {"amount": "40.00"}
+        )
+        self.assertEqual(status, 201, pay)
+        set_time("payments", pay["id"], "2030-01-10T00:00:00Z")
+
+        # 已收满的发票
+        status, pay = self._request(
+            "POST", f"/api/v1/invoices/{i_paid}/payments", {"amount": "100.00"}
+        )
+        self.assertEqual(status, 201, pay)
+
+        # KRW：0 位小数，金额字符串不带小数点
+        status, krw = self._request(
+            "POST",
+            "/api/v1/invoices",
+            {"currency": "KRW", "lines": [{"net": "5000", "tax_rate": "0"}]},
+        )
+        self.assertEqual(status, 201, krw)
+        self.assertEqual(krw["totals"]["total_gross"], "5000")
+        set_time("invoices", krw["id"], "2029-09-01T00:00:00Z")
+
+        def aging(as_of: str):
+            return self._request(
+                "GET", f"/api/v1/receivables/aging?as_of={as_of}"
+            )
+
+        status, body = aging("2030-01-15")
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["as_of"], "2030-01-15")
+        self.assertEqual(body["cutoff_at"], "2030-01-15T23:59:59Z")
+
+        by_ccy = {c["currency"]: c for c in body["currencies"]}
+        self.assertIn("EUR", by_ccy)
+        self.assertIn("KRW", by_ccy)
+        # 币种按代码升序：EUR 在 KRW 之前
+        names = [c["currency"] for c in body["currencies"]]
+        self.assertLess(names.index("EUR"), names.index("KRW"))
+
+        eur = by_ccy["EUR"]
+        self.assertEqual(eur["currency_digits"], 2)
+        self.assertEqual(eur["invoice_count"], 10)
+        self.assertEqual(eur["total_outstanding"], "960.00")
+        bk = {b["bucket"]: b for b in eur["buckets"]}
+        # 六个桶固定全部返回（空桶也为 0）
+        self.assertEqual(
+            [b["bucket"] for b in eur["buckets"]],
+            [
+                "no_due_date",
+                "current",
+                "overdue_1_30",
+                "overdue_31_60",
+                "overdue_61_90",
+                "overdue_91_plus",
+            ],
+        )
+        self.assertEqual(bk["no_due_date"],
+                         {"bucket": "no_due_date", "invoice_count": 1, "outstanding": "100.00"})
+        self.assertEqual(bk["current"],
+                         {"bucket": "current", "invoice_count": 1, "outstanding": "100.00"})
+        self.assertEqual(bk["overdue_1_30"],
+                         {"bucket": "overdue_1_30", "invoice_count": 2, "outstanding": "160.00"})
+        self.assertEqual(bk["overdue_31_60"],
+                         {"bucket": "overdue_31_60", "invoice_count": 2, "outstanding": "200.00"})
+        self.assertEqual(bk["overdue_61_90"],
+                         {"bucket": "overdue_61_90", "invoice_count": 2, "outstanding": "200.00"})
+        self.assertEqual(bk["overdue_91_plus"],
+                         {"bucket": "overdue_91_plus", "invoice_count": 2, "outstanding": "200.00"})
+        # 桶发票数之和 == 币种发票数；桶未收之和 == 币种总未收
+        self.assertEqual(sum(b["invoice_count"] for b in eur["buckets"]), 10)
+        self.assertEqual(
+            str(sum(Decimal(b["outstanding"]) for b in eur["buckets"])), "960.00"
+        )
+
+        # KRW：0 位精度，无到期日
+        krw_block = by_ccy["KRW"]
+        self.assertEqual(krw_block["currency_digits"], 0)
+        self.assertEqual(krw_block["invoice_count"], 1)
+        self.assertEqual(krw_block["total_outstanding"], "5000")
+        kb = {b["bucket"]: b for b in krw_block["buckets"]}
+        self.assertEqual(kb["no_due_date"]["outstanding"], "5000")
+        self.assertEqual(kb["no_due_date"]["invoice_count"], 1)
+        self.assertEqual(kb["current"]["outstanding"], "0")
+
+    def test_37_receivables_aging_cutoff_and_validation(self) -> None:
+        # GBP：验证「查询日 UTC 结束时」闭区间口径（发票创建/收款/冲销）
+        import sqlite3
+        from datetime import datetime, timezone
+
+        db_file = os.environ["DB_PATH"]
+
+        def set_time(table: str, row_id: int, ts: str) -> None:
+            c = sqlite3.connect(db_file, timeout=30)
+            try:
+                c.execute(
+                    f"UPDATE {table} SET created_at = ? WHERE id = ?", (ts, row_id)
+                )
+                c.commit()
+            finally:
+                c.close()
+
+        def gbp_invoice(due: str | None) -> int:
+            status, body = self._request(
+                "POST",
+                "/api/v1/invoices",
+                # net 100 + 10% 税 -> total_gross 110.00
+                {"currency": "GBP", "due_date": due,
+                 "lines": [{"net": "100.00", "tax_rate": "0.10"}]},
+            )
+            self.assertEqual(status, 201, body)
+            self.assertEqual(body["totals"]["total_gross"], "110.00")
+            return body["id"]
+
+        a = gbp_invoice("2030-01-10")
+        set_time("invoices", a, "2030-01-10T00:00:00Z")
+        b = gbp_invoice("2030-01-16")
+        set_time("invoices", b, "2030-01-16T12:00:00Z")  # 15 日结束之后才创建
+        c = gbp_invoice(None)
+        set_time("invoices", c, "2030-01-15T23:59:59Z")  # 恰在截止秒创建 -> 计入
+
+        # A：截止秒收 30（计入）、截止秒冲销 10（计入）、次日 00:00:00 再收 50
+        status, pay1 = self._request(
+            "POST", f"/api/v1/invoices/{a}/payments", {"amount": "30.00"}
+        )
+        self.assertEqual(status, 201, pay1)
+        set_time("payments", pay1["id"], "2030-01-15T23:59:59Z")
+        status, rev = self._request(
+            "POST", f"/api/v1/payments/{pay1['id']}/reversals", {"amount": "10.00"}
+        )
+        self.assertEqual(status, 201, rev)
+        set_time("payment_reversals", rev["id"], "2030-01-15T23:59:59Z")
+        status, pay2 = self._request(
+            "POST", f"/api/v1/invoices/{a}/payments", {"amount": "50.00"}
+        )
+        self.assertEqual(status, 201, pay2)
+        set_time("payments", pay2["id"], "2030-01-16T00:00:00Z")
+
+        def aging(as_of: str | None):
+            q = "" if as_of is None else f"?as_of={as_of}"
+            return self._request("GET", f"/api/v1/receivables/aging{q}")
+
+        gbp = lambda body: next(x for x in body["currencies"] if x["currency"] == "GBP")
+
+        # 14 日：只有 A 已创建且尚无流水，未收 110，逾期 4 天
+        status, body = aging("2030-01-14")
+        self.assertEqual(status, 200, body)
+        block = gbp(body)
+        self.assertEqual(block["invoice_count"], 1)
+        self.assertEqual(block["total_outstanding"], "110.00")
+        bk = {x["bucket"]: x for x in block["buckets"]}
+        self.assertEqual(bk["overdue_1_30"]["invoice_count"], 1)
+        self.assertEqual(bk["overdue_1_30"]["outstanding"], "110.00")
+        self.assertEqual(bk["no_due_date"]["invoice_count"], 0)
+
+        # 15 日截止秒：A 净收 20（30−10，当秒均计入）-> 未收 90；
+        # C 恰在截止秒创建 -> 计入；B 次日创建 -> 排除
+        status, body = aging("2030-01-15")
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["cutoff_at"], "2030-01-15T23:59:59Z")
+        block = gbp(body)
+        self.assertEqual(block["invoice_count"], 2, block)
+        self.assertEqual(block["total_outstanding"], "200.00")
+        bk = {x["bucket"]: x for x in block["buckets"]}
+        self.assertEqual(bk["overdue_1_30"],
+                         {"bucket": "overdue_1_30", "invoice_count": 1, "outstanding": "90.00"})
+        self.assertEqual(bk["no_due_date"],
+                         {"bucket": "no_due_date", "invoice_count": 1, "outstanding": "110.00"})
+
+        # 16 日：A 净收 70 -> 未收 40；B 当日 12:00 已创建、到期当日 -> current
+        status, body = aging("2030-01-16")
+        self.assertEqual(status, 200, body)
+        block = gbp(body)
+        self.assertEqual(block["invoice_count"], 3)
+        self.assertEqual(block["total_outstanding"], "260.00")
+        bk = {x["bucket"]: x for x in block["buckets"]}
+        self.assertEqual(bk["overdue_1_30"]["outstanding"], "40.00")
+        self.assertEqual(bk["current"]["invoice_count"], 1)
+        self.assertEqual(bk["current"]["outstanding"], "110.00")
+        self.assertEqual(bk["no_due_date"]["invoice_count"], 1)
+
+        # 非法日期 -> 422
+        for bad in ("2030-13-01", "2030-02-30", "2030-01-15T00:00:00Z", "abc", "30-01-2030"):
+            status, body = aging(bad)
+            self.assertEqual(status, 422, bad)
+            self.assertIn("detail", body)
+
+        # 缺省 as_of：取 UTC 当前日期，cutoff 为当日 23:59:59Z
+        status, body = aging(None)
+        self.assertEqual(status, 200, body)
+        today = datetime.now(timezone.utc).date().isoformat()
+        self.assertEqual(body["as_of"], today)
+        self.assertEqual(body["cutoff_at"], f"{today}T23:59:59Z")
+
 
 if __name__ == "__main__":
     unittest.main()
